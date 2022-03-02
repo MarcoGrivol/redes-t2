@@ -1,5 +1,4 @@
 import asyncio, time
-from random import sample
 from tcputils import *
 from secrets import randbits
 
@@ -75,7 +74,8 @@ class Conexao:
         self.ack_no = ack_no
         self.callback = None
         self.timer = None
-        self.buffer = []
+        self.pktsQ = []
+        self.sent_pkts = []
         self.timeout_interval = 1
         self.start_time = None
         self.estimated_rtt = None
@@ -83,23 +83,20 @@ class Conexao:
         self.cwnd = 1
 
     def _timeout(self):
-        if self.cwnd > 1:
-            self.cwnd = self.cwnd // 2
-        package, _ = self.buffer[0]
-        self.buffer[0] = (package, None)
-        self.servidor.rede.enviar(package, self.dst_addr)
+        self.cwnd = max(1, self.cwnd // 2)
+        for i, (pkt, _) in enumerate(self.sent_pkts):
+            self.sent_pkts[i] = (pkt, None) # remove timing since it was not recvd
+        pkt, _ = self.sent_pkts[0]
+        self.servidor.rede.enviar(pkt, self.dst_addr)
         self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._timeout)
-        # package, _ = self.buffer[0]
-        # self.buffer[0] = (package, None)
-        # # _, _, seq, ack, flags, _, _, _ = read_header(package)
-        # self.servidor.rede.enviar(package, self.dst_addr)
 
-    def _get_idx_inQ(self, acked_pkt):
-        for i, (pkt, _) in enumerate(self.buffer):
+    def _get_idx(self, acked_pkt):
+        max_idx = None
+        for i, (pkt, _) in enumerate(self.sent_pkts):
             _, _, seq_not_acked, _, _, _, _, _ = read_header(pkt)
-            if acked_pkt >= seq_not_acked:
-                return i
-        return None
+            if acked_pkt > seq_not_acked:
+                max_idx = i
+        return max_idx
 
     def _calc_timeout_interval(self, t0, t1):
         sample_rtt = t1 - t0
@@ -111,43 +108,43 @@ class Conexao:
         self.dev_rtt = (1 - 0.25) * self.dev_rtt + 0.25 * abs(sample_rtt - self.estimated_rtt)
         return self.estimated_rtt + 4 * self.dev_rtt
             
+    def _ack_pkt(self, ack_no):
+        if len(self.sent_pkts) == 0:
+            return
+        self.cwnd += 1
+        idx = self._get_idx(ack_no)
+        _, t0 = self.sent_pkts[idx]
+        del self.sent_pkts[:idx + 1]
+        if t0 is not None:
+            self.timeout_interval = self._calc_timeout_interval(t0, time.time())
+        if len(self.sent_pkts) == 0:
+            self.timer.cancel()
+            self._send_window()
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        print('!!!', seq_no, ack_no, len(payload))
+        # print('-----------------------------------')
+        # print('recebido payload: %r' % payload[:25])
+        # print('self:', self.seq_no, self.ack_no)
+        # print('rcvd:', seq_no, ack_no)
+        # print('len', len(self.sent_pkts))
         if self.ack_no != seq_no:
             return
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.ack_no += 1
             payload = b''
-        elif len(payload) == 0:
-            if len(self.buffer) == 0:
-                return
-            # get idx of package from queue buff and remove
-            self.timer.cancel()
-            idx = self._get_idx_inQ(ack_no)
-            _, t0 = self.buffer[idx]
-            if t0 is not None:
-                self.timeout_interval = self._calc_timeout_interval(t0, time.time())
-                self.cwnd += 1
-            del self.buffer[:idx + 1]
-            return
-        else:
+            package_header = make_header(self.src_port, self.dst_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            package_header = fix_checksum(package_header, self.src_addr, self.dst_addr)
+            self.servidor.rede.enviar(package_header, self.dst_addr)
+            self.callback(self, payload)
+        elif len(payload) != 0:
             self.ack_no += len(payload)
-        print('recebido payload: %r' % payload[:25])
-        print('self:', self.seq_no, self.ack_no)
-        print('rcvd:', seq_no, ack_no, '\n')
-        package_header = make_header(
-            self.src_port,
-            self.dst_port,
-            self.seq_no,
-            self.ack_no,
-            FLAGS_ACK
-        )
-        package_header = fix_checksum(package_header, self.src_addr, self.dst_addr)
-        self.servidor.rede.enviar(package_header, self.dst_addr)
-        self.callback(self, payload)
-        if self.timer is not None:
-            self.timer.cancel()
+            package_header = make_header(self.src_port, self.dst_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            package_header = fix_checksum(package_header, self.src_addr, self.dst_addr)
+            self.servidor.rede.enviar(package_header, self.dst_addr)
+            self.callback(self, payload)
+
+        if len(self.sent_pkts) != 0:
+            self._ack_pkt(ack_no)
 
     def registrar_recebedor(self, callback):
         """
@@ -156,29 +153,40 @@ class Conexao:
         """
         self.callback = callback
 
+    def _send_window(self):
+        if len(self.pktsQ) == 0:
+            return
+        i = 0
+        while i < self.cwnd and len(self.pktsQ) != 0:
+            package = self.pktsQ.pop(0)
+            self.sent_pkts.append((package, time.time()))
+            _, _, seq, ack, _, _, _, _ = read_header(package)
+            self.servidor.rede.enviar(package, self.dst_addr)
+            i += 1
+        if self.timer is not None:
+            self.timer.cancel()
+        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._timeout)
+
     def enviar(self, dados):
         """
         Usado pela camada de aplicação para enviar dados
         """
-        print(f'Enviando dados ({len(dados)}): seq_no: {self.seq_no + 1} ack_no: {self.ack_no} - {dados[:5]}')
-        package_header = make_header(
-            self.src_port, self.dst_port, self.seq_no + 1, self.ack_no, FLAGS_ACK
-        )
-        package = fix_checksum(package_header + dados[:MSS], self.src_addr, self.dst_addr)
-        self.servidor.rede.enviar(package, self.dst_addr)
-        self.buffer.append((package, time.time()))
-        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._timeout)
-        self.seq_no += len(dados[:MSS])
-
-        if len(dados) > MSS:
-            self.enviar(dados[MSS:])
+        while len(dados) != 0:
+            package_header = make_header(
+                self.src_port, self.dst_port, self.seq_no + 1, self.ack_no, FLAGS_ACK
+            )
+            package = fix_checksum(package_header + dados[:MSS], self.src_addr, self.dst_addr)
+            self.pktsQ.append(package)
+            self.seq_no += len(dados[:MSS])
+            dados = dados[MSS:]
+        self._send_window()
+            
 
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
-        print('Fechando conexao')
         package_header = make_header(
             self.src_port, self.dst_port, self.seq_no + 1, self.ack_no, FLAGS_FIN
         )
